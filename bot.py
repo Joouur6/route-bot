@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 Bot de Telegram para optimización de rutas de reparto.
-ADAPTADO PARA RENDER.COM (incluye servidor HTTP health-check).
+VERSIÓN 2 - Mejor manejo de errores en geocodificación.
 """
 
 import os
 import re
 import sys
-import math
 import time
 import logging
 import requests
@@ -32,7 +31,6 @@ ORS_API_KEY = os.getenv("ORS_API_KEY")
 DEPOT_ADDRESS = os.getenv("DEPOT_ADDRESS", "Madrid, España")
 START_HOUR = os.getenv("START_HOUR", "09:30")
 END_HOUR = os.getenv("END_HOUR", "15:00")
-VEHICLE_SPEED_KMH = float(os.getenv("VEHICLE_SPEED_KMH", "40"))
 PORT = int(os.getenv("PORT", "8000"))
 
 (ESPERANDO_DIRECCIONES, ESPERANDO_ORIGEN) = range(2)
@@ -43,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Servidor HTTP para Render.com (health check) ───
+# ─── Servidor HTTP para Render.com ───
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -51,31 +49,53 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is running")
     def log_message(self, format, *args):
-        pass  # Silenciar logs del servidor HTTP
+        pass
 
 def start_http_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"Health server started on port {PORT}")
+    logger.info(f"Health server on port {PORT}")
     server.serve_forever()
 
-# ─── Utilidades ───
+# ─── Geocodificación con timeout y retry ───
 
-def nominatim_geocode(address: str):
+def nominatim_geocode(address: str, max_retries=2):
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": address, "format": "json", "limit": 1, "addressdetails": 1}
+    params = {
+        "q": address,
+        "format": "json",
+        "limit": 1,
+        "addressdetails": 1,
+        "countrycodes": "es",  # Limitar a España
+    }
     headers = {"User-Agent": "RouteOptimizerBot/1.0"}
-    try:
-        time.sleep(1.1)
-        r = requests.get(url, params=params, headers=headers, timeout=15)
-        data = r.json()
-        if data:
-            return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"]), "display_name": data[0]["display_name"]}
-    except Exception as e:
-        logger.error(f"Error geocodificando '{address}': {e}")
+
+    for attempt in range(max_retries):
+        try:
+            time.sleep(1.2)  # Respetar rate limit
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            data = r.json()
+            if data:
+                return {
+                    "lat": float(data[0]["lat"]),
+                    "lon": float(data[0]["lon"]),
+                    "display_name": data[0]["display_name"],
+                }
+            logger.warning(f"Nominatim no encontró: {address}")
+            return None
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout en intento {attempt+1} para: {address}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+        except Exception as e:
+            logger.error(f"Error geocodificando '{address}': {e}")
+            return None
     return None
 
 
 def ors_matrix(coordinates):
+    if not ORS_API_KEY:
+        logger.error("Falta ORS_API_KEY")
+        return None, None
     url = "https://api.openrouteservice.org/v2/matrix/driving-car"
     headers = {"Authorization": ORS_API_KEY, "Content-Type": "application/json"}
     body = {"locations": coordinates, "metrics": ["duration", "distance"], "units": "m"}
@@ -90,18 +110,24 @@ def ors_matrix(coordinates):
 
 
 def parse_input(text: str):
-    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip() and not l.strip().startswith("/")]
     deliveries = []
     start_dt = datetime.strptime(START_HOUR, "%H:%M")
     end_dt = datetime.strptime(END_HOUR, "%H:%M")
     global_tw_min = (start_dt.hour * 60 + start_dt.minute)
     global_tw_max = (end_dt.hour * 60 + end_dt.minute)
+
     for line in lines:
+        # Ignorar líneas vacías o comandos
+        if not line or line.startswith("/"):
+            continue
+
         parts = line.split("|")
         address = parts[0].strip()
         has_tw = False
         tw_min = global_tw_min
         tw_max = global_tw_max
+
         if len(parts) > 1:
             time_str = parts[1].strip()
             match = re.match(r"(\d{1,2}):?(\d{2})", time_str)
@@ -112,14 +138,23 @@ def parse_input(text: str):
                 tw_min = max(global_tw_min, fixed_min - margin)
                 tw_max = min(global_tw_max, fixed_min + margin)
                 has_tw = True
-        deliveries.append({"address": address, "tw_min": tw_min, "tw_max": tw_max, "has_tw": has_tw})
+
+        deliveries.append({
+            "address": address,
+            "tw_min": tw_min,
+            "tw_max": tw_max,
+            "has_tw": has_tw,
+        })
     return deliveries, global_tw_min, global_tw_max
 
 
-def solve_tsptw(deliveries, depot_coords, duration_matrix, distance_matrix, global_tw_min, global_tw_max):
+def solve_tsptw(deliveries, duration_matrix, distance_matrix, global_tw_min, global_tw_max):
     n = len(deliveries)
     if n == 0:
         return None, None, None
+    if n == 1:
+        return [{"node": 0, "arrival_minutes": global_tw_min}], 0, 0
+
     manager = pywrapcp.RoutingIndexManager(n, 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
@@ -220,21 +255,34 @@ async def ruta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def recibir_direcciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text.strip().lower() == "/listo":
+    text = update.message.text.strip()
+
+    if text.lower() == "/listo":
         if not context.user_data.get("raw_lines"):
-            await update.message.reply_text("❌ No has enviado direcciones todavía.")
+            await update.message.reply_text("❌ No has enviado direcciones todavía. Escribe al menos una.")
             return ESPERANDO_DIRECCIONES
+
         raw = "\n".join(context.user_data["raw_lines"])
         deliveries, global_tw_min, global_tw_max = parse_input(raw)
+
+        if not deliveries:
+            await update.message.reply_text("❌ No pude interpretar ninguna dirección válida.")
+            return ESPERANDO_DIRECCIONES
+
         context.user_data["deliveries"] = deliveries
         context.user_data["global_tw_min"] = global_tw_min
         context.user_data["global_tw_max"] = global_tw_max
+
         await update.message.reply_text(
             f"✅ He recibido {len(deliveries)} direcciones.\n"
-            f"¿Desde qué dirección sales? (Escribe /omitir para usar: <b>{DEPOT_ADDRESS}</b>)"
+            f"¿Desde qué dirección sales? (Escribe /omitir para usar: {DEPOT_ADDRESS})"
         )
         return ESPERANDO_ORIGEN
+
+    if text.startswith("/"):
+        await update.message.reply_text("❓ Comando no reconocido. Sigue enviando direcciones o escribe /listo para procesar.")
+        return ESPERANDO_DIRECCIONES
+
     if "raw_lines" not in context.user_data:
         context.user_data["raw_lines"] = []
     context.user_data["raw_lines"].append(text)
@@ -249,57 +297,87 @@ async def recibir_origen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["origin_address"] = text
     else:
         context.user_data["origin_address"] = DEPOT_ADDRESS
-    await update.message.reply_text("🧠 Procesando ruta óptima... un momento.")
+
+    await update.message.reply_text("🧠 Procesando ruta óptima... esto puede tardar 1-2 minutos.")
 
     deliveries = context.user_data["deliveries"]
     origin_address = context.user_data["origin_address"]
+
+    # Geocodificar origen
+    await update.message.reply_text("📍 Geocodificando dirección de origen...")
     origin_geo = nominatim_geocode(origin_address)
     if not origin_geo:
-        await update.message.reply_text(f"❌ No pude geocodificar el origen: {origin_address}")
+        await update.message.reply_text(f"❌ No pude geocodificar el origen: {origin_address}. Prueba con una dirección más completa (incluyendo ciudad).")
         return ConversationHandler.END
 
+    # Geocodificar entregas
+    await update.message.reply_text(f"📍 Geocodificando {len(deliveries)} direcciones...")
     coords = [[origin_geo["lon"], origin_geo["lat"]]]
     display_names = [origin_geo["display_name"]]
     failed = []
+    valid_deliveries = []
+
     for i, d in enumerate(deliveries):
+        await update.message.reply_text(f"🔍 Buscando dirección {i+1}/{len(deliveries)}: {d['address'][:40]}...")
         geo = nominatim_geocode(d["address"])
         if geo:
             coords.append([geo["lon"], geo["lat"]])
             display_names.append(geo["display_name"])
+            valid_deliveries.append(d)
         else:
             failed.append(d["address"])
+            logger.warning(f"No se pudo geocodificar: {d['address']}")
 
     if failed:
-        await update.message.reply_text("⚠️ No pude geocodificar (se omiten):\n" + "\n".join(failed))
-        clean_deliveries = [d for d in deliveries if d["address"] not in failed]
-        deliveries = clean_deliveries
-        context.user_data["deliveries"] = deliveries
-        if not deliveries:
-            await update.message.reply_text("❌ No quedan direcciones válidas.")
-            return ConversationHandler.END
+        failed_text = "\n".join([f"• {f}" for f in failed])
+        await update.message.reply_text(
+            f"⚠️ No pude geocodificar estas direcciones (se omiten):\n{failed_text}\n\n"
+            f"Consejo: Añade la ciudad y código postal para mejorar la precisión."
+        )
 
-    durations, distances = ors_matrix(coords)
-    if durations is None:
-        await update.message.reply_text("❌ Error al consultar OpenRouteService.")
+    if not valid_deliveries:
+        await update.message.reply_text("❌ Ninguna dirección pudo ser geocodificada. Prueba con direcciones más completas.")
         return ConversationHandler.END
 
-    depot_entry = {"address": origin_address, "tw_min": context.user_data["global_tw_min"], "tw_max": context.user_data["global_tw_max"], "has_tw": False}
-    full_nodes = [depot_entry] + deliveries
+    # Consultar ORS
+    await update.message.reply_text("🛣️ Consultando rutas reales por carretera...")
+    durations, distances = ors_matrix(coords)
+    if durations is None:
+        await update.message.reply_text("❌ Error al consultar OpenRouteService. Revisa tu API key.")
+        return ConversationHandler.END
+
+    # Resolver TSP
+    await update.message.reply_text("🧮 Calculando ruta óptima...")
+    depot_entry = {
+        "address": origin_address,
+        "tw_min": context.user_data["global_tw_min"],
+        "tw_max": context.user_data["global_tw_max"],
+        "has_tw": False,
+    }
+    full_nodes = [depot_entry] + valid_deliveries
 
     route, total_distance, total_duration = solve_tsptw(
-        full_nodes, origin_geo, durations, distances,
+        full_nodes, durations, distances,
         context.user_data["global_tw_min"],
         context.user_data["global_tw_max"],
     )
+
     if not route:
-        await update.message.reply_text("❌ No encontré ruta válida con esas restricciones de horario.")
+        await update.message.reply_text(
+            "❌ No encontré una ruta válida con esas restricciones de horario.\n"
+            "Las horas fijas pueden ser incompatibles con la distancia entre puntos."
+        )
         return ConversationHandler.END
 
+    # Construir respuesta
     lines = []
     lines.append("📋 <b>RUTA OPTIMIZADA</b> (ahorro combustible)")
     lines.append(f"⛽ Distancia total: <b>{total_distance/1000:.1f} km</b>")
     lines.append(f"⏱️ Tiempo conducción: <b>{total_duration//60} min</b>")
+    if failed:
+        lines.append(f"⚠️ Omitidas: {len(failed)} direcciones no encontradas")
     lines.append("")
+
     keyboard = []
 
     for i, stop in enumerate(route):
@@ -310,10 +388,11 @@ async def recibir_origen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         arr = minutes_to_hour_str(stop["arrival_minutes"])
         lat = coords[node_idx][1]
         lon = coords[node_idx][0]
+
         if i == 0:
             lines.append(f"🏭 <b>Salida:</b> {name} — <b>{arr}</b>")
         elif i == len(route) - 1:
-            lines.append(f"🏁 <b>Regreso al origen:</b> — <b>{arr}</b>")
+            lines.append(f"🏁 <b>Regreso:</b> {name} — <b>{arr}</b>")
         else:
             tw_info = ""
             if full_nodes[node_idx]["has_tw"]:
@@ -329,6 +408,7 @@ async def recibir_origen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.insert(0, [InlineKeyboardButton("🗺️ Waze: Ruta completa", url=waze_full)])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=reply_markup)
     return ConversationHandler.END
 
@@ -340,19 +420,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TOKEN:
-        logger.error("Falta BOT_TOKEN en variables de entorno."); sys.exit(1)
+        logger.error("Falta BOT_TOKEN"); sys.exit(1)
     if not ORS_API_KEY:
-        logger.warning("Falta ORS_API_KEY.")
+        logger.warning("Falta ORS_API_KEY - las rutas no funcionarán")
 
-    # Iniciar servidor HTTP en un thread separado (para Render.com)
     threading.Thread(target=start_http_server, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("ruta", ruta_command)],
         states={
-            ESPERANDO_DIRECCIONES: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_direcciones), CommandHandler("listo", recibir_direcciones)],
-            ESPERANDO_ORIGEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_origen)],
+            ESPERANDO_DIRECCIONES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_direcciones),
+                CommandHandler("listo", recibir_direcciones),
+            ],
+            ESPERANDO_ORIGEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_origen),
+            ],
         },
         fallbacks=[CommandHandler("cancelar", cancel)],
     )
