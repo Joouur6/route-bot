@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot de Telegram para optimización de rutas de reparto.
-VERSIÓN 3 - Corregido puerto para Render.com
+VERSIÓN 4 - Simplificada, sin servidor HTTP interno.
 """
 
 import os
@@ -11,8 +11,6 @@ import sys
 import time
 import logging
 import requests
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -32,10 +30,6 @@ DEPOT_ADDRESS = os.getenv("DEPOT_ADDRESS", "Madrid, España")
 START_HOUR = os.getenv("START_HOUR", "09:30")
 END_HOUR = os.getenv("END_HOUR", "15:00")
 
-# Render asigna un puerto aleatorio en la variable PORT
-# Si no existe, usamos 8000 como fallback
-PORT = int(os.environ.get("PORT", "8000"))
-
 (ESPERANDO_DIRECCIONES, ESPERANDO_ORIGEN) = range(2)
 
 logging.basicConfig(
@@ -43,24 +37,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# ─── Servidor HTTP para Render.com ───
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
-    def log_message(self, format, *args):
-        pass
-
-def start_http_server():
-    try:
-        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-        logger.info(f"Health server started on port {PORT}")
-        server.serve_forever()
-    except Exception as e:
-        logger.error(f"Error starting HTTP server: {e}")
 
 # ─── Geocodificación ───
 
@@ -427,9 +403,6 @@ def main():
         logger.error("Falta BOT_TOKEN"); sys.exit(1)
     if not ORS_API_KEY:
         logger.warning("Falta ORS_API_KEY - las rutas no funcionarán")
-
-    # Iniciar servidor HTTP en un thread separado (para Render.com)
-    threading.Thread(target=start_http_server, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
     conv_handler = ConversationHandler(
