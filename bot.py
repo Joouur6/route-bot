@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot de Telegram para optimización de rutas de reparto.
-VERSIÓN 2 - Mejor manejo de errores en geocodificación.
+VERSIÓN 3 - Corregido puerto para Render.com
 """
 
 import os
@@ -31,7 +31,10 @@ ORS_API_KEY = os.getenv("ORS_API_KEY")
 DEPOT_ADDRESS = os.getenv("DEPOT_ADDRESS", "Madrid, España")
 START_HOUR = os.getenv("START_HOUR", "09:30")
 END_HOUR = os.getenv("END_HOUR", "15:00")
-PORT = int(os.getenv("PORT", "8000"))
+
+# Render asigna un puerto aleatorio en la variable PORT
+# Si no existe, usamos 8000 como fallback
+PORT = int(os.environ.get("PORT", "8000"))
 
 (ESPERANDO_DIRECCIONES, ESPERANDO_ORIGEN) = range(2)
 
@@ -52,11 +55,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 def start_http_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"Health server on port {PORT}")
-    server.serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        logger.info(f"Health server started on port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Error starting HTTP server: {e}")
 
-# ─── Geocodificación con timeout y retry ───
+# ─── Geocodificación ───
 
 def nominatim_geocode(address: str, max_retries=2):
     url = "https://nominatim.openstreetmap.org/search"
@@ -65,13 +71,13 @@ def nominatim_geocode(address: str, max_retries=2):
         "format": "json",
         "limit": 1,
         "addressdetails": 1,
-        "countrycodes": "es",  # Limitar a España
+        "countrycodes": "es",
     }
     headers = {"User-Agent": "RouteOptimizerBot/1.0"}
 
     for attempt in range(max_retries):
         try:
-            time.sleep(1.2)  # Respetar rate limit
+            time.sleep(1.2)
             r = requests.get(url, params=params, headers=headers, timeout=10)
             data = r.json()
             if data:
@@ -83,7 +89,7 @@ def nominatim_geocode(address: str, max_retries=2):
             logger.warning(f"Nominatim no encontró: {address}")
             return None
         except requests.exceptions.Timeout:
-            logger.warning(f"Timeout en intento {attempt+1} para: {address}")
+            logger.warning(f"Timeout intento {attempt+1} para: {address}")
             if attempt < max_retries - 1:
                 time.sleep(2)
         except Exception as e:
@@ -118,7 +124,6 @@ def parse_input(text: str):
     global_tw_max = (end_dt.hour * 60 + end_dt.minute)
 
     for line in lines:
-        # Ignorar líneas vacías o comandos
         if not line or line.startswith("/"):
             continue
 
@@ -307,7 +312,7 @@ async def recibir_origen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📍 Geocodificando dirección de origen...")
     origin_geo = nominatim_geocode(origin_address)
     if not origin_geo:
-        await update.message.reply_text(f"❌ No pude geocodificar el origen: {origin_address}. Prueba con una dirección más completa (incluyendo ciudad).")
+        await update.message.reply_text(f"❌ No pude geocodificar el origen: {origin_address}. Prueba con una dirección más completa.")
         return ConversationHandler.END
 
     # Geocodificar entregas
@@ -332,18 +337,18 @@ async def recibir_origen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         failed_text = "\n".join([f"• {f}" for f in failed])
         await update.message.reply_text(
             f"⚠️ No pude geocodificar estas direcciones (se omiten):\n{failed_text}\n\n"
-            f"Consejo: Añade la ciudad y código postal para mejorar la precisión."
+            f"Consejo: Añade la ciudad y código postal."
         )
 
     if not valid_deliveries:
-        await update.message.reply_text("❌ Ninguna dirección pudo ser geocodificada. Prueba con direcciones más completas.")
+        await update.message.reply_text("❌ Ninguna dirección pudo ser geocodificada.")
         return ConversationHandler.END
 
     # Consultar ORS
     await update.message.reply_text("🛣️ Consultando rutas reales por carretera...")
     durations, distances = ors_matrix(coords)
     if durations is None:
-        await update.message.reply_text("❌ Error al consultar OpenRouteService. Revisa tu API key.")
+        await update.message.reply_text("❌ Error al consultar OpenRouteService.")
         return ConversationHandler.END
 
     # Resolver TSP
@@ -364,8 +369,7 @@ async def recibir_origen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not route:
         await update.message.reply_text(
-            "❌ No encontré una ruta válida con esas restricciones de horario.\n"
-            "Las horas fijas pueden ser incompatibles con la distancia entre puntos."
+            "❌ No encontré ruta válida con esas restricciones de horario."
         )
         return ConversationHandler.END
 
@@ -424,6 +428,7 @@ def main():
     if not ORS_API_KEY:
         logger.warning("Falta ORS_API_KEY - las rutas no funcionarán")
 
+    # Iniciar servidor HTTP en un thread separado (para Render.com)
     threading.Thread(target=start_http_server, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
